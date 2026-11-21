@@ -81,10 +81,6 @@ def _(asset_path, component_color_sequence, load_color_map):
     FASTA_URL = "https://data.genomespy.app/genomes/hg38/hg38.fa"
     CATV1 = "https://huggingface.co/programmable-genomics/CATv1"
     ENCODE = "https://www.encodeproject.org"
-    CRISPR_URLS = {
-        "training (K562)": "https://raw.githubusercontent.com/EngreitzLab/CRISPR_comparison/v1.0.0/resources/crispr_data/EPCrisprBenchmark_combined_data.training_K562.GRCh38.tsv.gz",
-        "held-out (5 cell types)": "https://raw.githubusercontent.com/EngreitzLab/CRISPR_comparison/v1.0.0/resources/crispr_data/EPCrisprBenchmark_combined_data.heldout_5_cell_types.GRCh38.tsv.gz",
-    }
 
     # ---- Epifolio palettes ----
     CN_LEVELS = ["0", "1", "2", "3", "4", "5", "6+", "Unmapped"]
@@ -159,7 +155,6 @@ def _(asset_path, component_color_sequence, load_color_map):
         CN_COLORS,
         CN_LEVELS,
         COHORT_MAX,
-        CRISPR_URLS,
         CYTOBAND_URL,
         DETAIL_MAX,
         EMBEDDINGS,
@@ -178,8 +173,8 @@ def _(asset_path, component_color_sequence, load_color_map):
 
 
 @app.cell
-def _(CATV1, CRISPR_URLS, ENCODE, cnv, functools, gzip, io, json, mo, pl, urlreq):
-    # ---- External atlases: CATv1 sequence models, ENCODE-rE2G links, CRISPRi benchmark ----
+def _(CATV1, ENCODE, cnv, functools, gzip, io, json, mo, pl, urlreq):
+    # ---- External atlases: CATv1 sequence models and ENCODE-rE2G links ----
     def _get(url: str, headers: dict | None = None, timeout: int = 60) -> bytes:
         req = urlreq.Request(url, headers={"User-Agent": "epifolio-notebook", **(headers or {})})
         with urlreq.urlopen(req, timeout=timeout) as r:
@@ -258,40 +253,25 @@ def _(CATV1, CRISPR_URLS, ENCODE, cnv, functools, gzip, io, json, mo, pl, urlreq
             return {"annotation": ann["accession"], "description": ann.get("description", "")}, links
         return None, None
 
-    @mo.cache
-    def read_crispr() -> pl.DataFrame:
-        frames = []
-        for split, url in CRISPR_URLS.items():
-            df = pl.read_csv(io.BytesIO(gzip.decompress(_get(url))), separator="\t", infer_schema_length=20000)
-            frames.append(
-                df.select(
-                    "chrom",
-                    pl.col("chromStart").cast(pl.Int64).alias("start"),
-                    pl.col("chromEnd").cast(pl.Int64).alias("end"),
-                    pl.col("startTSS").cast(pl.Int64).alias("tss"),
-                    pl.col("measuredGeneSymbol").alias("gene"),
-                    pl.col("CellType").alias("cell"),
-                    pl.col("Regulated").cast(pl.String).str.to_lowercase().eq("true").alias("regulated"),
-                    pl.col("EffectSize").cast(pl.Float32).alias("score"),
-                    pl.lit(split).alias("split"),
-                )
-            )
-        return (
-            pl.concat(frames)
-            .filter(pl.col("chrom").is_in(cnv.CHROMS))
-            .with_columns(
-                pl.when(pl.col("regulated"))
-                .then(pl.lit("CRISPRi regulated"))
-                .otherwise(pl.lit("CRISPRi tested"))
-                .alias("source")
-            )
-        )
-
-    return read_catv1_meta, read_crispr, resolve_e2g, resolve_model
+    return read_catv1_meta, resolve_e2g, resolve_model
 
 
 @app.cell
-def _(BLOCK, CYTOBAND_URL, EMBEDDINGS, PROGRAMS, REFSEQ_URL, cnv, functools, io, mo, np, pl, pq, urlreq):
+def _(
+    BLOCK,
+    CYTOBAND_URL,
+    EMBEDDINGS,
+    PROGRAMS,
+    REFSEQ_URL,
+    cnv,
+    functools,
+    io,
+    mo,
+    np,
+    pl,
+    pq,
+    urlreq,
+):
     # ---- Session-level reads of the hosted Epifolio CNV x ATAC payload ----
     with mo.status.spinner(title="Opening the Epifolio CNV × ATAC payload…"):
         DATA = cnv.open_dataset([cnv.source(n) for n in (cnv.TRACKS, cnv.DISTRIBUTIONS)])
@@ -483,7 +463,16 @@ def _(BLOCK, CYTOBAND_URL, EMBEDDINGS, PROGRAMS, REFSEQ_URL, cnv, functools, io,
 
 
 @app.cell
-def _(CELL_LINE_CATV1, DETAIL, FALLBACK_COMPARE, SAMPLES, mo, pl, read_catv1_meta, resolve_model):
+def _(
+    CELL_LINE_CATV1,
+    DETAIL,
+    FALLBACK_COMPARE,
+    SAMPLES,
+    mo,
+    pl,
+    read_catv1_meta,
+    resolve_model,
+):
     # ---- Initial focus tumor and its tissue-matched sequence models (spec defaults only) ----
     _first = SAMPLES.filter((pl.col("cohort") == "BRCA") & pl.col("biosample").map_elements(lambda b: bool(DETAIL.healthy.get(b)), return_dtype=pl.Boolean))
     INITIAL_FOCUS = (_first if _first.height else SAMPLES).row(0, named=True)["biosample"]
@@ -520,7 +509,15 @@ def _(INITIAL_FOCUS, mo):
     get_stream, set_stream = mo.state("")
     # Plain mutable store shared by the browser callbacks and the push cells below.
     STATE: dict = {"view": None, "focus_loaded": None, "cohort_key": None, "rows": [], "atac_rows": []}
-    return STATE, get_focus, get_sel, get_stream, set_focus, set_sel, set_stream
+    return (
+        STATE,
+        get_focus,
+        get_sel,
+        get_stream,
+        set_focus,
+        set_sel,
+        set_stream,
+    )
 
 
 @app.cell
@@ -552,16 +549,6 @@ def _(
     def title(text):
         return {"text": text, "style": "overlay-title"}
 
-    # One nominal scale serves every "Colour by" choice, so switching is a parameter flip.
-    _cls = list(CCRE_CLASSES)
-    _color_scale = {
-        "domain": PROGRAMS + ["none"] + CN_LEVELS + _cls,
-        "range": NMF_COLORS + ["#cbd5e1"] + CN_COLORS + list(CCRE_CLASSES.values()),
-    }
-    _colour_expr = (
-        "colorBy == 'ASCAT CN' ? datum.copy_number : "
-        "(colorBy == 'ENCODE class' ? (isValid(datum.class) ? datum.class : 'none') : datum.nmf)"
-    )
     _cn_scale = {"domain": CN_LEVELS, "range": CN_COLORS}
     _fade_out = {"unitsPerPixel": [60_000, 20_000], "values": [1, 0]}
     _fade_in = {"unitsPerPixel": [60_000, 20_000], "values": [0, 1]}
@@ -731,7 +718,36 @@ def _(
     }
 
     def z_track(name, field, label, height, coloured):
-        colour = {"field": "_c", "type": "nominal", "scale": _color_scale, "legend": None}
+        fill = {"value": "#94a3b8"}
+        line = "#1e293b" if coloured else "#475569"
+
+        def profile(data, filters, tooltip, max_gap):
+            # Continuous z profile: a 3-point running mean, joined to the next point by a line segment and
+            # shaded down to zero. GenomeSpy has no line/area mark, so both come from a window transform
+            # over neighbours, applied after the filters so hidden cCREs never bridge the line.
+            steps = filters + [
+                {"type": "formula", "expr": "(datum.start + datum.end) / 2", "as": "_x"},
+                {"type": "window", "groupby": ["chrom"], "sort": {"field": "_x"}, "ops": ["mean"], "fields": [field], "frame": [-1, 1], "as": ["_zs"]},
+                {"type": "window", "groupby": ["chrom"], "sort": {"field": "_x"}, "ops": ["lead", "lead"], "fields": ["_x", "_zs"], "as": ["_x2", "_zs2"]},
+                {"type": "filter", "expr": f"isValid(datum._x2) && datum._x2 - datum._x <= {max_gap}"},
+                {"type": "formula", "expr": "(datum._zs + datum._zs2) / 2", "as": "_zm"},
+            ]
+            return [
+                {
+                    "data": data,
+                    "transform": steps,
+                    "mark": {"type": "rect", "minWidth": 0.5, "opacity": 0.3},
+                    "encoding": {"x": X("_x"), "x2": X2("_x2"), "y": {"field": "_zm", "type": "quantitative"}, "y2": {"datum": 0}, "color": fill, "tooltip": tooltip},
+                },
+                {
+                    "data": data,
+                    "transform": steps,
+                    "mark": {"type": "rule", "size": 1.4, "color": line, "tooltip": None},
+                    "encoding": {"x": X("_x"), "x2": X2("_x2"), "y": {"field": "_zs", "type": "quantitative"}, "y2": {"field": "_zs2"}},
+                },
+            ]
+
+        _ccre_filters = [_noread, _prog] if coloured else [{"type": "filter", "expr": f"datum.{field} > -9.99"}, _prog]
         return {
             "name": name,
             "height": height,
@@ -751,36 +767,8 @@ def _(
                     "mark": {"type": "rule", "color": "#94a3b8", "strokeDash": [3, 3], "tooltip": None},
                     "encoding": {"y": {"datum": 0, "type": "quantitative"}},
                 },
-                {
-                    "data": {"name": "bins"},
-                    "opacity": _fade_out,
-                    "transform": [
-                        {"type": "filter", "expr": f"isValid(datum.{field})"},
-                        {"type": "formula", "expr": _colour_expr, "as": "_c"},
-                    ],
-                    "mark": {"type": "rect", "minWidth": 0.5},
-                    "encoding": {
-                        "x": X(),
-                        "x2": X2(),
-                        "y2": {"datum": 0},
-                        "color": colour if coloured else {"value": "#64748b"},
-                        "tooltip": _bin_tip,
-                    },
-                },
-                {
-                    "data": {"name": "ccres"},
-                    "opacity": _fade_in,
-                    "transform": (
-                        [_noread, _prog] if coloured else [{"type": "filter", "expr": f"datum.{field} > -9.99"}, _prog]
-                    )
-                    + [{"type": "formula", "expr": _colour_expr, "as": "_c"}],
-                    "mark": {"type": "point", "size": 12, "strokeWidth": 0},
-                    "encoding": {
-                        "x": X("mid"),
-                        "color": colour if coloured else {"value": "#475569"},
-                        "tooltip": _ccre_tip,
-                    },
-                },
+                {"opacity": _fade_out, "layer": profile({"name": "bins"}, [{"type": "filter", "expr": f"isValid(datum.{field})"}], _bin_tip, 1e12)},
+                {"opacity": _fade_in, "layer": profile({"name": "ccres"}, _ccre_filters, _ccre_tip, 50_000)},
             ],
         }
 
@@ -794,7 +782,13 @@ def _(
         "title": title("NMF cCRE loadings (W) - stacked top programs"),
         "encoding": {
             "y": {"field": "_y1", "type": "quantitative", "title": None, "scale": {"zero": True}, "axis": {"tickCount": 2}},
-            "color": {"field": "nmf", "type": "nominal", "scale": _color_scale, "legend": None},
+            # Program colours straight from the Epifolio NMF colour map (NMF{i+1} <- Comp_{i}).
+            "color": {
+                "field": "nmf",
+                "type": "nominal",
+                "scale": {"domain": PROGRAMS + ["none"], "range": NMF_COLORS + ["#cbd5e1"]},
+                "legend": None,
+            },
         },
         "layer": [
             {
@@ -902,41 +896,63 @@ def _(
         ],
     }
 
+    # Same encoding as the NMF locus browser: blue domes, opacity scaled by the rE2G score.
     links = {
         "name": "links",
-        "height": 52,
-        "title": title("Enhancer -> gene - ENCODE-rE2G (matched tissue, up) - CRISPRi (down)"),
+        "height": 48,
+        "title": title("Enhancer -> gene - ENCODE-rE2G (matched tissue)"),
         "data": {"name": "links"},
         "transform": [
             {"type": "formula", "expr": "0", "as": "_base"},
-            {"type": "formula", "expr": "datum.source == 'ENCODE-rE2G' ? 1 : -1", "as": "_apex"},
-            {
-                "type": "formula",
-                "expr": "datum.source == 'CRISPRi tested' ? 0.35 : (datum.source == 'ENCODE-rE2G' ? 0.25 + 0.75 * datum.score : 1)",
-                "as": "_op",
-            },
+            {"type": "formula", "expr": "1", "as": "_apex"},
+            {"type": "formula", "expr": "max(0.06, min(1, (datum.score - 0.18) / 0.72))", "as": "_op"},
         ],
-        "mark": {"type": "link", "linkShape": "dome", "orient": "vertical", "clampApex": True, "size": 1.2, "minPickingSize": 4},
+        "mark": {
+            "type": "link",
+            "linkShape": "dome",
+            "orient": "vertical",
+            "clampApex": True,
+            "color": "#2563eb",
+            "size": 1.5,
+            "minPickingSize": 5,
+        },
         "encoding": {
             "x": X("mid"),
             "x2": X2("tss"),
-            "y": {"field": "_base", "type": "quantitative", "scale": {"domain": [-1, 1]}, "axis": None},
+            "y": {"field": "_base", "type": "quantitative", "scale": {"domain": [0, 1]}, "axis": None},
             "y2": {"field": "_apex"},
-            "color": {
-                "field": "source",
-                "type": "nominal",
-                "scale": {
-                    "domain": ["ENCODE-rE2G", "CRISPRi regulated", "CRISPRi tested"],
-                    "range": ["#7c3aed", "#dc2626", "#cbd5e1"],
-                },
-                "legend": None,
-            },
             "opacity": {"field": "_op", "type": "quantitative", "scale": None},
             "tooltip": [
                 {"field": "gene", "title": "Target gene"},
-                {"field": "source", "title": "Source"},
-                {"field": "score", "title": "rE2G score / CRISPRi effect", "format": ".3f"},
-                {"field": "cell", "title": "Cell type"},
+                {"field": "score", "title": "rE2G score", "format": ".3f"},
+                {"field": "cell", "title": "Tissue"},
+                {"field": "start", "title": "Enhancer start"},
+                {"field": "end", "title": "Enhancer end"},
+                {"field": "tss", "title": "Gene TSS"},
+            ],
+        },
+    }
+
+    ccre_strip = {
+        "name": "ccre_strip",
+        "height": 24,
+        "title": title("ENCODE v4 cCREs"),
+        "data": {"name": "ccres"},
+        "mark": {"type": "rect", "minWidth": 1.5, "minOpacity": 0.85},
+        "encoding": {
+            "x": X(),
+            "x2": X2(),
+            "color": {
+                "field": "class",
+                "type": "nominal",
+                "scale": {"domain": list(CCRE_CLASSES), "range": list(CCRE_CLASSES.values())},
+                "legend": None,
+            },
+            "tooltip": [
+                {"field": "cCRE", "title": "cCRE"},
+                {"field": "class", "title": "ENCODE class"},
+                {"field": "nmf", "title": "Dominant program"},
+                {"field": "copy_number", "title": "ASCAT CN"},
             ],
         },
     }
@@ -1044,11 +1060,6 @@ def _(
         {"name": "nav"},
         # Browser-only display controls (rendered by GenomeSpy; no Python round trip).
         {
-            "name": "colorBy",
-            "value": "NMF program",
-            "bind": {"input": "radio", "options": ["NMF program", "ASCAT CN", "ENCODE class"], "name": "Colour cCREs by "},
-        },
-        {
             "name": "progFocus",
             "value": "all",
             "bind": {"input": "select", "options": ["all"] + PROGRAMS, "name": "Only program "},
@@ -1064,10 +1075,12 @@ def _(
         {"name": "motifUrl", "value": _p.get("motifs") or ""},
         {"name": "cmpUrl", "value": _c.get("contrib") or ""},
     ]
-    TRACK_ORDER = [cyto, genes, ascat, tumor, normal, nmf, cohort_cn, cohort_atac, links, pred,
+    # Genes -> rE2G links -> cCREs -> focus tumor CN + ATAC vs matched normal -> NMF loadings ->
+    # sequence-model tracks -> cohort ATAC heatmap -> cohort copy number.
+    TRACK_ORDER = [cyto, genes, links, ccre_strip, ascat, tumor, normal, nmf, pred,
                    dynseq("dynseq", "contribUrl", "Primary model - contribution scores (dynseq letters below ~300 bp)", "#0f766e"),
                    dynseq("dynseq_cmp", "cmpUrl", "Compare model - contribution scores", "#b45309"),
-                   motifs]
+                   motifs, cohort_atac, cohort_cn]
     BROWSER_SPEC = {
         "assembly": "hg38",
         "datasets": {k: [] for k in ("cyto", "genes", "overview_cn", "segments", "bins", "ccres", "nmf_stack", "cohort_cn", "cohort_atac", "links")},
@@ -1096,7 +1109,7 @@ def _(
     DETAIL_MAX,
     LIN,
     PROGRAMS,
-    STATE,
+    STATE: dict,
     cnv,
     gs,
     np,
@@ -1353,7 +1366,15 @@ def _(
 
     browser.observe(_on_params, names=["parameter_values"])
     browser.observe(_on_click, names=["click_revision"])
-    return browser, current_view, go_to, lin_to_pos, push, set_params, stream_cohort, stream_focus
+    return (
+        browser,
+        current_view,
+        go_to,
+        push,
+        set_params,
+        stream_cohort,
+        stream_focus,
+    )
 
 
 @app.cell
@@ -1409,7 +1430,20 @@ def _(SAMPLES, get_focus, mo, pl, set_focus):
 
 
 @app.cell
-def _(BASE, DETAIL, SAMPLES, cnv, get_focus, mo, np, pl, push, read_cn, read_z, set_params):
+def _(
+    BASE,
+    DETAIL,
+    SAMPLES,
+    cnv,
+    get_focus,
+    mo,
+    np,
+    pl,
+    push,
+    read_cn,
+    read_z,
+    set_params,
+):
     # ---- Load the focus tumor genome-wide and push it into the running browser ----
     focus = get_focus()
     header = SAMPLES.filter(pl.col("biosample") == focus).row(0, named=True)
@@ -1469,7 +1503,21 @@ def _(MODELS, PROGRAMS, mo, model_dd, np, pl, read_w):
 
 
 @app.cell
-def _(NO_READ, STATE, W, cn_segments, current_view, dom_label, frame, modal_cn, pl, push, read_genes, stream_focus, wdom):
+def _(
+    NO_READ,
+    STATE: dict,
+    W,
+    cn_segments,
+    current_view,
+    dom_label,
+    frame,
+    modal_cn,
+    pl,
+    push,
+    read_genes,
+    stream_focus,
+    wdom,
+):
     # ---- Genome-wide bins (drawn when zoomed out) and per-cCRE detail for the current window ----
     STATE.update(frame=frame, W=W, dom_label=dom_label, wdom=wdom)
     _ok = pl.col("tumor_z") > NO_READ
@@ -1528,28 +1576,31 @@ def _(NO_READ, STATE, W, cn_segments, current_view, dom_label, frame, modal_cn, 
         for kind, tbl in (("gain", _amps), ("loss", _dels))
         for r in tbl.iter_rows(named=True)
     }
-    return focal_events, overview_bins
+    return (focal_events,)
 
 
 @app.cell
-def _(STATE, cnv, current_view, header, mo, pl, read_crispr, resolve_e2g, stream_focus):
-    # ---- Enhancer -> gene links for the focus tumor's tissue (ENCODE-rE2G) plus the CRISPRi benchmark ----
+def _(
+    STATE: dict,
+    cnv,
+    current_view,
+    header,
+    mo,
+    pl,
+    resolve_e2g,
+    stream_focus,
+):
+    # ---- Enhancer -> gene links for the focus tumor's tissue (ENCODE-rE2G) ----
     _tissue = header.get("encode_tissue")
     with mo.status.spinner(title="Resolving enhancer–gene links for this tissue…"):
         try:
             e2g_meta, e2g_links = resolve_e2g(_tissue) if _tissue else (None, None)
         except Exception as _e:
             e2g_meta, e2g_links = {"error": str(_e)}, None
-        try:
-            crispr = read_crispr()
-        except Exception:
-            crispr = None
     _cols = ["chrom", "start", "end", "mid", "tss", "gene", "score", "cell", "source"]
     _parts = []
     if e2g_links is not None:
         _parts.append(e2g_links.with_columns(pl.lit(str(_tissue or "")).alias("cell"), pl.lit("ENCODE-rE2G").alias("source")))
-    if crispr is not None:
-        _parts.append(crispr)
     if _parts:
         _all = (
             pl.concat([p.select("chrom", "start", "end", "tss", "gene", pl.col("score").cast(pl.Float32), "cell", "source") for p in _parts])
@@ -1565,7 +1616,7 @@ def _(STATE, cnv, current_view, header, mo, pl, read_crispr, resolve_e2g, stream
     else:
         STATE["links_all"] = None
     stream_focus(*current_view(), force=True)
-    return crispr, e2g_links, e2g_meta
+    return e2g_links, e2g_meta
 
 
 @app.cell
@@ -1576,7 +1627,7 @@ def _(
     DETAIL,
     LIN,
     SAMPLES,
-    STATE,
+    STATE: dict,
     cnv,
     cohorts_ms,
     current_view,
@@ -1733,7 +1784,6 @@ def _(
     cohorts_ms,
     compare_dd,
     compare_model,
-    crispr,
     e2g_links,
     e2g_meta,
     events_dd,
@@ -1772,7 +1822,6 @@ def _(
         if isinstance(e2g_meta, dict) and e2g_meta.get("annotation")
         else "no ENCODE-rE2G links for this tissue"
     )
-    _cr = f"CRISPRi {crispr.height:,} pairs" if crispr is not None else "CRISPRi unavailable"
     _ref = f"{header['encode_tissue']} ({healthy_col[2:]})" if healthy_col else "no matched ENCODE normal"
     _n = rows_df.height
     mo.vstack(
@@ -1783,7 +1832,7 @@ def _(
                 f"— focus <b>{sample16}</b> · {header['sex']}, {header['age']} y · {header['diagnosis']} · "
                 f"normal: {_ref} · ploidy {modal_cn} · heatmaps: {_n} tumors in {', '.join(cohorts_ms.value) or 'no cohort'}</span>"
                 f"<br><span style='font-size:0.74rem;opacity:0.65'>{_model_txt(primary_model, 'Primary')} · "
-                f"{_model_txt(compare_model, 'Compare')} · {_e2g} · {_cr} · {row_note} · {get_stream()}</span>"
+                f"{_model_txt(compare_model, 'Compare')} · {_e2g} · {row_note} · {get_stream()}</span>"
             ),
             mo.hstack(
                 [focus_cancer_dd, focus_patient_dd, focus_aliquot_dd, model_dd, events_dd, preset_dd, goto_text],
@@ -1807,7 +1856,7 @@ def _(browser):
 
 
 @app.cell
-def _(CN_COLORS, CN_LEVELS, NMF_COLORS, PROGRAMS, mo):
+def _(CCRE_CLASSES, CN_COLORS, CN_LEVELS, NMF_COLORS, PROGRAMS, mo):
     def _sw(c, t):
         return (
             "<span style='display:inline-flex;align-items:center;gap:2px;margin-right:6px'>"
@@ -1821,7 +1870,8 @@ def _(CN_COLORS, CN_LEVELS, NMF_COLORS, PROGRAMS, mo):
         + " &nbsp;<b>NMF program</b> "
         + "".join(_sw(c, t.removeprefix("NMF")) for t, c in zip(PROGRAMS, NMF_COLORS))
         + " &nbsp;<b>ATAC z</b> " + _sw("#2563eb", "low") + _sw("#f8fafc", "0") + _sw("#dc2626", "high")
-        + " &nbsp;<b>Links</b> " + _sw("#7c3aed", "rE2G") + _sw("#dc2626", "CRISPRi regulated") + _sw("#cbd5e1", "CRISPRi tested")
+        + " &nbsp;<b>cCRE</b> " + "".join(_sw(c, t) for t, c in CCRE_CLASSES.items())
+        + " &nbsp;<b>Links</b> " + _sw("#2563eb", "ENCODE-rE2G (opacity = score)")
         + "<br><span style='opacity:.7'>scroll = zoom · drag = pan · drag on the top genome strip = jump · "
         "<b>shift+drag</b> on the tumor track or click = select cCREs · click a heatmap row = focus that tumor · "
         "letters appear below ~300 bp · display options are under the browser</span></div>"
@@ -1863,7 +1913,6 @@ def _(
     W,
     cnv,
     cohort_matrix,
-    crispr,
     dom_label,
     e2g_links,
     frame,
@@ -1942,15 +1991,6 @@ def _(
                     else None,
                     "rE2G targets",
                 ),
-                _overlap(
-                    crispr.with_columns(
-                        (pl.col("gene") + " (" + pl.col("cell") + pl.when(pl.col("regulated")).then(pl.lit(", regulated")).otherwise(pl.lit("")) + ")").alias("_label"),
-                        pl.col("regulated").cast(pl.Int8).alias("_sort"),
-                    )
-                    if crispr is not None
-                    else None,
-                    "CRISPRi tested",
-                ),
             ]
             _front = []
             for _x in _extras:
@@ -1989,7 +2029,21 @@ def _(
 
 
 @app.cell
-def _(COHORT_CN, CN_LEVELS, cnv, cohort_matrix, frame, get_sel, go, mo, np, pl, rows_df, sections, sel_rows):
+def _(
+    CN_LEVELS,
+    COHORT_CN,
+    cnv,
+    cohort_matrix,
+    frame,
+    get_sel,
+    go,
+    mo,
+    np,
+    pl,
+    rows_df,
+    sections,
+    sel_rows,
+):
     # ---- Cohort at selection: dosage and accessibility of the selected cCREs across every chosen tumor ----
     _out = None
     _sel = get_sel()
@@ -2082,7 +2136,23 @@ def _(COHORT_CN, CN_LEVELS, cnv, cohort_matrix, frame, get_sel, go, mo, np, pl, 
 
 
 @app.cell
-def _(CN_COLORS, CN_LEVELS, NMF_COLORS, NO_READ, PROGRAMS, cnv, dom_label, frame, go, healthy_col, mo, modal_cn, np, pl, sections):
+def _(
+    CN_COLORS,
+    CN_LEVELS,
+    NMF_COLORS,
+    NO_READ,
+    PROGRAMS,
+    cnv,
+    dom_label,
+    frame,
+    go,
+    healthy_col,
+    mo,
+    modal_cn,
+    np,
+    pl,
+    sections,
+):
     # ---- Dosage: is the focus tumor's accessibility explained by its own copy number? ----
     _out = None
     if sections.value == "Dosage":
@@ -2184,7 +2254,21 @@ def _(CN_COLORS, CN_LEVELS, NMF_COLORS, NO_READ, PROGRAMS, cnv, dom_label, frame
 
 
 @app.cell
-def _(NMF_COLORS, PROGRAMS, SAMPLES, go, header, mo, model_dd, model_file, pl, read_h, rows_df, sample16, sections):
+def _(
+    NMF_COLORS,
+    PROGRAMS,
+    SAMPLES,
+    go,
+    header,
+    mo,
+    model_dd,
+    model_file,
+    pl,
+    read_h,
+    rows_df,
+    sample16,
+    sections,
+):
     # ---- Programs: the focus tumor's NMF activity against its cohort, and every cohort's program mix ----
     _out = None
     if sections.value == "Programs":
@@ -2296,8 +2380,7 @@ def _(COHORT_MAX, DETAIL_MAX, EMBEDDINGS, cnv, mo, sections):
     - NMF cCRE weights and sample activities: `{EMBEDDINGS}/{{adjusted,confounded,tcga.atac}}.nmf.{{ccre,sample}}.pq`
     - Cohort CN segments are computed in memory from `summary_ccre_membership.parquet` at start-up.
     - [CATv1](https://huggingface.co/programmable-genomics/CATv1) → ENCODE ChromBPNet bigWig/bigBed files (byte-range streamed)
-    - ENCODE-rE2G links for the focus tumor's normal tissue; CRISPRi benchmark from
-      [CRISPR_comparison v1.0.0](https://github.com/EngreitzLab/CRISPR_comparison/tree/v1.0.0/resources/crispr_data) (not tissue-matched)
+    - ENCODE-rE2G links for the focus tumor's normal tissue
     - hg38 RefSeq genes, cytobands and indexed FASTA from genomespy.app
 
     **Caveats**
